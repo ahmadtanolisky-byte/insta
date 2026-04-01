@@ -25,6 +25,8 @@ COOKIES_FILE = "ig_cookies.json"
 
 app  = Flask(__name__, static_folder='.', static_url_path='')
 lock = Lock()
+lock_acquired_at = None   # track when lock was grabbed
+LOCK_TIMEOUT = 600        # auto-release after 10 minutes
 
 # Live progress tracker
 progress = {"count": 0, "phase": "", "active": False}
@@ -51,13 +53,41 @@ def get_progress():
     return jsonify(progress)
 
 
+@app.route("/api/unlock", methods=["POST"])
+def unlock():
+    """Force-release the scrape lock — use if stuck."""
+    global lock_acquired_at
+    progress["active"] = False
+    progress["phase"] = ""
+    if lock.locked():
+        try:
+            lock.release()
+        except RuntimeError:
+            pass
+    lock_acquired_at = None
+    return jsonify({"ok": True, "message": "Lock released. You can scrape again."})
+
+
 @app.route("/api/scrape", methods=["POST"])
 def scrape():
+    global lock_acquired_at
+
     if not Path(COOKIES_FILE).exists():
         return jsonify({"error": "No session found. Run 'python login.py' first."}), 503
 
+    # Auto-release lock if it's been held for more than LOCK_TIMEOUT seconds
+    if lock.locked() and lock_acquired_at is not None:
+        if time.time() - lock_acquired_at > LOCK_TIMEOUT:
+            try:
+                lock.release()
+            except RuntimeError:
+                pass  # already released
+
     if not lock.acquire(blocking=False):
-        return jsonify({"error": "Another scrape is running. Please wait and try again."}), 429
+        elapsed = int(time.time() - lock_acquired_at) if lock_acquired_at else 0
+        return jsonify({"error": f"Another scrape is running ({elapsed}s). Please wait and try again."}), 429
+
+    lock_acquired_at = time.time()
 
     try:
         data     = request.json or {}
@@ -965,5 +995,4 @@ if __name__ == "__main__":
         print("\n  ✓  Session ready — no user login needed")
         print("  Open in browser → http://127.0.0.1:5000\n")
 
-    import os
-    app.run(debug=False, port=int(os.environ.get("PORT", 5000)), host="0.0.0.0")
+    app.run(debug=False, port=5000, host="127.0.0.1")

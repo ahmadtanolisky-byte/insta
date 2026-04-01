@@ -266,11 +266,22 @@ function hideAlerts() {
   ['errorBox','warnBox','successBox'].forEach(id =>
     document.getElementById(id).classList.remove('show'));
 }
-function showError(msg) {
+function showError(msg, showUnlock = false) {
   hideAlerts();
   const b = document.getElementById('errorBox');
-  b.innerHTML = '⚠ ' + msg;
+  b.innerHTML = '⚠ ' + msg + (showUnlock
+    ? ' <button onclick="forceUnlock()" style="margin-left:12px;background:rgba(233,69,96,.2);border:1px solid var(--accent);color:var(--accent);border-radius:6px;padding:3px 10px;cursor:pointer;font-size:12px;font-family:var(--mono)">Force Unlock</button>'
+    : '');
   b.classList.add('show');
+}
+
+async function forceUnlock() {
+  await fetch('/api/unlock', { method: 'POST' });
+  hideAlerts();
+  document.getElementById('scrapeBtn').disabled = false;
+  document.getElementById('scrapeBtn').textContent = '🔍 Extract Viral Posts';
+  setLoading(false);
+  showWarn('Unlocked. You can now start a new scrape.');
 }
 function showWarn(msg) {
   hideAlerts();
@@ -353,7 +364,8 @@ async function scrape() {
     });
     const d = await r.json();
     if (!r.ok) {
-      showError(d.error || 'Something went wrong. Check the terminal for details.');
+      const isLocked = r.status === 429;
+      showError(d.error || 'Something went wrong. Check the terminal for details.', isLocked);
       return;
     }
     if (limit > 0 && d.count < limit) {
