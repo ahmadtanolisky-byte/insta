@@ -75,10 +75,13 @@
   /* Loader */
   .loader{display:none;text-align:center;padding:52px 0}
   .loader.show{display:block}
-  .spinner{width:48px;height:48px;border:3px solid rgba(233,69,96,.15);border-top-color:var(--accent);border-radius:50%;animation:spin .9s linear infinite;margin:0 auto 16px}
+  .spinner{width:48px;height:48px;border:3px solid rgba(233,69,96,.15);border-top-color:var(--accent);border-radius:50%;animation:spin .9s linear infinite;margin:0 auto 20px}
   @keyframes spin{to{transform:rotate(360deg)}}
-  .loader-text{font-family:var(--mono);color:var(--muted);font-size:14px;animation:blink 1.5s ease-in-out infinite}
-  @keyframes blink{0%,100%{opacity:1}50%{opacity:.4}}
+  .live-counter{margin:0 auto 10px}
+  .counter-number{font-size:clamp(3rem,10vw,5.5rem);font-weight:800;line-height:1;background:linear-gradient(135deg,var(--accent),var(--pink),var(--accent2));-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;transition:all .2s;font-variant-numeric:tabular-nums;letter-spacing:-.03em}
+  .counter-label{font-family:var(--mono);font-size:12px;color:var(--muted);letter-spacing:.15em;text-transform:uppercase;margin-top:2px}
+  .counter-phase{font-family:var(--mono);color:var(--accent);font-size:13px;margin-bottom:6px;letter-spacing:.05em;min-height:20px}
+  .loader-text{font-family:var(--mono);color:var(--muted);font-size:12px;opacity:.5}
 
   /* Results */
   .results-section{display:none}
@@ -178,7 +181,12 @@
 
   <div class="loader" id="loader">
     <div class="spinner"></div>
-    <div class="loader-text" id="loaderText">Connecting to Instagram…</div>
+    <div class="live-counter" id="liveCounter">
+      <div class="counter-number" id="counterNum">0</div>
+      <div class="counter-label">posts extracted</div>
+    </div>
+    <div class="counter-phase" id="counterPhase">Connecting to Instagram…</div>
+    <div class="loader-text" id="loaderText"></div>
   </div>
 
   <!-- Results -->
@@ -214,16 +222,8 @@
 let sortBy = 'likes';
 let cachedPosts = [];
 let cachedUsername = '';
-
-const loaderMsgs = [
-  'Connecting to Instagram…',
-  'Loading profile data…',
-  'Fetching posts — please wait…',
-  'Analysing engagement metrics…',
-  'Ranking viral content…',
-  'Almost there…'
-];
-let loaderTimer;
+let progressTimer = null;
+let displayedCount = 0;
 
 // ── Session status ────────────────────────────────────────────────────────────
 async function checkStatus() {
@@ -279,22 +279,56 @@ function showWarn(msg) {
   b.classList.add('show');
 }
 
+function animateCount(target) {
+  const el = document.getElementById('counterNum');
+  const start = displayedCount;
+  if (start === target) return;
+  const diff = target - start;
+  const duration = Math.min(600, Math.max(200, diff * 8));
+  const startTime = performance.now();
+  function step(now) {
+    const t = Math.min(1, (now - startTime) / duration);
+    const eased = 1 - Math.pow(1 - t, 3);
+    const val = Math.round(start + diff * eased);
+    el.textContent = val.toLocaleString();
+    if (t < 1) requestAnimationFrame(step);
+    else { el.textContent = target.toLocaleString(); displayedCount = target; }
+  }
+  requestAnimationFrame(step);
+}
+
+function startProgressPolling() {
+  displayedCount = 0;
+  document.getElementById('counterNum').textContent = '0';
+  document.getElementById('counterPhase').textContent = 'Connecting to Instagram…';
+  progressTimer = setInterval(async () => {
+    try {
+      const r = await fetch('/api/progress');
+      const d = await r.json();
+      animateCount(d.count || 0);
+      if (d.phase) document.getElementById('counterPhase').textContent = d.phase;
+    } catch { /* ignore */ }
+  }, 800);
+}
+
+function stopProgressPolling() {
+  clearInterval(progressTimer);
+  progressTimer = null;
+}
+
 function setLoading(on) {
   const el  = document.getElementById('loader');
   const btn = document.getElementById('scrapeBtn');
   if (on) {
     el.classList.add('show');
-    btn.disabled = true; btn.textContent = '⏳ Extracting…';
-    let i = 0;
-    document.getElementById('loaderText').textContent = loaderMsgs[0];
-    loaderTimer = setInterval(() => {
-      i = (i+1) % loaderMsgs.length;
-      document.getElementById('loaderText').textContent = loaderMsgs[i];
-    }, 3000);
+    btn.disabled = true;
+    btn.textContent = '⏳ Extracting…';
+    startProgressPolling();
   } else {
     el.classList.remove('show');
-    btn.disabled = false; btn.textContent = '🔍 Extract Viral Posts';
-    clearInterval(loaderTimer);
+    btn.disabled = false;
+    btn.textContent = '🔍 Extract Viral Posts';
+    stopProgressPolling();
   }
 }
 

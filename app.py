@@ -26,6 +26,9 @@ COOKIES_FILE = "ig_cookies.json"
 app  = Flask(__name__, static_folder='.', static_url_path='')
 lock = Lock()
 
+# Live progress tracker
+progress = {"count": 0, "phase": "", "active": False}
+
 
 # ── Routes ────────────────────────────────────────────────────────────────────
 
@@ -41,6 +44,11 @@ def index():
 def status():
     ok = Path(COOKIES_FILE).exists()
     return jsonify({"session_ok": ok, "account": "team-session" if ok else ""})
+
+
+@app.route("/api/progress")
+def get_progress():
+    return jsonify(progress)
 
 
 @app.route("/api/scrape", methods=["POST"])
@@ -64,7 +72,15 @@ def scrape():
         if not username:
             return jsonify({"error": "Username is required."}), 400
 
+        progress["count"] = 0
+        progress["phase"] = "Starting…"
+        progress["active"] = True
+
         posts, error = get_posts(username, limit, sort_by)
+
+        progress["active"] = False
+        progress["phase"] = ""
+
         if error:
             return jsonify({"error": error}), 400
 
@@ -210,6 +226,8 @@ def get_posts(username, display_limit, sort_by):
             all_posts.extend(batch)
             intercepted.clear()
             page_count += 1
+            progress["count"] = len(all_posts)
+            progress["phase"] = "Scrolling profile…"
             print(f"  → Page {page_count}: {len(batch)} posts | total: {len(all_posts)} | cursor: {end_cursor is not None}")
 
             # ── Phase 1: Scroll to load initial posts (~first 300) ────────
@@ -227,6 +245,8 @@ def get_posts(username, display_limit, sort_by):
                     all_posts.extend(batch)
                     end_cursor = new_cursor or end_cursor
                     page_count += 1
+                    progress["count"] = len(all_posts)
+                    progress["phase"] = "Scrolling profile…"
                     print(f"  → Scroll page {page_count}: +{len(batch)} posts | total: {len(all_posts)}")
                     no_change = 0
                 else:
@@ -243,6 +263,7 @@ def get_posts(username, display_limit, sort_by):
             # issues. The fetch() runs inside the page so cookies are sent.
             if user_id and len(all_posts) < limit:
                 print(f"  → Switching to direct API pagination (user_id={user_id})...")
+                progress["phase"] = "Fetching via API…"
 
                 # Only navigate back if we've left the profile page
                 if f"instagram.com/{username}" not in page.url:
@@ -297,6 +318,8 @@ def get_posts(username, display_limit, sort_by):
                             added     = len(all_posts) - prev_len
                             max_id    = new_cursor
                             api_fails = 0
+                            progress["count"] = len(all_posts)
+                            progress["phase"] = "Fetching via API…"
                             print(f"  → API page: +{added} posts | total: {len(all_posts)} | more: {max_id is not None}")
                             if not max_id:
                                 print("  → Reached end of account.")
@@ -317,6 +340,7 @@ def get_posts(username, display_limit, sort_by):
             # ── Scrape Reels via direct API (includes play_count) ────────
             if user_id:
                 print(f"  → Fetching Reels via API for @{username}...")
+                progress["phase"] = "Fetching Reels…"
                 try:
                     # Get CSRF token from cookies file
                     csrf_token = ""
@@ -409,6 +433,7 @@ def get_posts(username, display_limit, sort_by):
                                 added = len(all_posts) - prev_len
                                 reels_total += len(batch)
                                 reel_fails = 0
+                                progress["count"] = len(all_posts)
                                 print(f"  → Reels: +{len(batch)} | total: {len(all_posts)} | more: {more}")
                             else:
                                 reel_fails += 1
@@ -940,4 +965,5 @@ if __name__ == "__main__":
         print("\n  ✓  Session ready — no user login needed")
         print("  Open in browser → http://127.0.0.1:5000\n")
 
-    app.run(debug=False, port=5000, host="127.0.0.1")
+    import os
+    app.run(debug=False, port=int(os.environ.get("PORT", 5000)), host="0.0.0.0")

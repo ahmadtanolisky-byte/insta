@@ -1,0 +1,6 @@
+services:
+  - type: web
+    name: instaviral
+    runtime: docker
+    plan: free
+    healthCheckPath: /api/status
