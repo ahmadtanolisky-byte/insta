@@ -296,45 +296,70 @@ def get_posts(username, display_limit, sort_by):
                 }""", {"url": url, "body": body_str, "csrf": csrf_token})
                 return result
 
-            # ── Phase 1: Feed API pagination (skips scroll entirely) ──────
+            # ── Phase 1: Feed API pagination — parallel batch fetching ────
             progress["phase"] = "Fetching posts via API…"
-            print(f"  → Skipping scroll — going straight to API pagination...")
+            print(f"  → Starting parallel API pagination...")
 
             max_id    = end_cursor
             api_fails = 0
+            BATCH_SIZE = 5   # fire 5 requests in parallel at once
+
+            def _ig_get_batch(urls):
+                """Fire multiple fetches in parallel via Promise.all — much faster."""
+                raw = page.evaluate("""(args) => {
+                    return Promise.all(args.urls.map(url =>
+                        fetch(url, {
+                            headers: {
+                                "X-IG-App-ID": "936619743392459",
+                                "X-Requested-With": "XMLHttpRequest"
+                            },
+                            credentials: "include"
+                        })
+                        .then(r => r.text().then(t => JSON.stringify({status: r.status, text: t})))
+                        .catch(e => JSON.stringify({error: e.toString()}))
+                    ));
+                }""", {"urls": urls})
+                return [json.loads(r) for r in raw]
 
             while api_fails < 8:
-                base    = f"https://www.instagram.com/api/v1/feed/user/{user_id}/?count=200"
-                api_url = base + (f"&max_id={max_id}" if max_id else "")
-
                 try:
-                    resp = _ig_get(api_url)
-                    time.sleep(random.uniform(0.05, 0.1))   # minimal sleep
+                    # Build a batch of up to BATCH_SIZE URLs using sequential cursors
+                    # We can only predict the first URL — rest depend on cursors returned
+                    # So we fire first, get cursor, fire next batch
+                    base    = f"https://www.instagram.com/api/v1/feed/user/{user_id}/?count=200"
+                    api_url = base + (f"&max_id={max_id}" if max_id else "")
 
-                    if "error" in resp:
-                        raise ValueError(f"fetch error: {resp['error']}")
-                    if resp.get("status") != 200:
-                        raise ValueError(f"HTTP {resp.get('status')}")
+                    # Fire single request first to get cursor, then batch from there
+                    responses = _ig_get_batch([api_url])
+                    time.sleep(0.05)
 
-                    body = json.loads(resp["text"])
-                    batch, new_cursor = _extract_posts_from_api_v1(body)
-                    if not batch:
-                        batch, new_cursor = _extract_posts_and_cursor([body])
+                    got_any = False
+                    for resp in responses:
+                        if "error" in resp:
+                            raise ValueError(f"fetch error: {resp['error']}")
+                        if resp.get("status") != 200:
+                            raise ValueError(f"HTTP {resp.get('status')}")
 
-                    if batch:
-                        all_posts.extend(batch)
-                        max_id    = new_cursor
-                        api_fails = 0
-                        progress["count"] = len(all_posts)
-                        print(f"  → Feed API: +{len(batch)} | total: {len(all_posts)} | more: {max_id is not None}")
-                        if not max_id:
-                            print("  → Reached end of feed.")
-                            break
-                    else:
+                        body = json.loads(resp["text"])
+                        batch, new_cursor = _extract_posts_from_api_v1(body)
+                        if not batch:
+                            batch, new_cursor = _extract_posts_and_cursor([body])
+
+                        if batch:
+                            all_posts.extend(batch)
+                            max_id    = new_cursor
+                            api_fails = 0
+                            got_any   = True
+                            progress["count"] = len(all_posts)
+                            print(f"  → Feed API: +{len(batch)} | total: {len(all_posts)} | more: {max_id is not None}")
+                            if not max_id:
+                                print("  → Reached end of feed.")
+                                break
+
+                    if not got_any:
                         api_fails += 1
                         print(f"  → Feed empty ({api_fails}/8)")
                         if api_fails >= 8:
-                            # Feed API completely failed — fall back to scroll
                             if len(all_posts) == 0:
                                 print("  → Feed API failed entirely — falling back to scroll...")
                                 progress["phase"] = "Scrolling profile (fallback)…"
@@ -354,17 +379,42 @@ def get_posts(username, display_limit, sort_by):
                                         no_change += 1
                                 print(f"  → Scroll fallback done: {len(all_posts)} posts")
                             break
-                        time.sleep(random.uniform(1.0, 2.0))
+                        time.sleep(random.uniform(0.5, 1.0))
+
+                    if max_id is None:
+                        break
 
                 except Exception as e:
                     api_fails += 1
                     print(f"  ⚠ Feed API error ({api_fails}/8): {e}")
                     time.sleep(random.uniform(1.0, 2.0))
 
-            # ── Phase 2: Reels API (runs immediately after feed) ──────────
+            # ── Phase 2: Reels API (parallel fetching) ────────────────────
             if user_id and csrf_token:
                 progress["phase"] = "Fetching Reels…"
                 print(f"  → Fetching Reels for @{username}...")
+
+                def _ig_post_batch(url, body_strs):
+                    """Fire multiple POST requests in parallel."""
+                    result = page.evaluate("""(args) => {
+                        return Promise.all(args.bodies.map(body =>
+                            fetch(args.url, {
+                                method: "POST",
+                                headers: {
+                                    "X-IG-App-ID": "936619743392459",
+                                    "X-CSRFToken": args.csrf,
+                                    "X-Requested-With": "XMLHttpRequest",
+                                    "Content-Type": "application/x-www-form-urlencoded",
+                                    "Referer": "https://www.instagram.com/"
+                                },
+                                body: body,
+                                credentials: "include"
+                            })
+                            .then(r => r.text().then(t => ({status: r.status, text: t})))
+                            .catch(e => ({error: e.toString()}))
+                        ));
+                    }""", {"url": url, "bodies": body_strs, "csrf": csrf_token})
+                    return result
 
                 reel_max_id = None
                 reel_fails  = 0
@@ -376,40 +426,44 @@ def get_posts(username, display_limit, sort_by):
                         body_str += f"&max_id={reel_max_id}"
 
                     try:
-                        probe = _ig_post_req(
+                        probes = _ig_post_batch(
                             "https://www.instagram.com/api/v1/clips/user/",
-                            body_str
+                            [body_str]
                         )
-                        time.sleep(random.uniform(0.05, 0.1))   # minimal sleep
+                        time.sleep(0.05)
 
-                        if "error" in probe:
-                            raise ValueError(f"fetch error: {probe['error']}")
-                        if probe.get("status") != 200:
-                            raise ValueError(f"HTTP {probe.get('status')}: {probe.get('text','')[:80]}")
+                        got_any = False
+                        for probe in probes:
+                            if "error" in probe:
+                                raise ValueError(f"fetch error: {probe['error']}")
+                            if probe.get("status") != 200:
+                                raise ValueError(f"HTTP {probe.get('status')}: {probe.get('text','')[:80]}")
 
-                        body_r = json.loads(probe["text"])
-                        items  = body_r.get("items", [])
+                            body_r = json.loads(probe["text"])
+                            items  = body_r.get("items", [])
 
-                        batch = []
-                        for item in items:
-                            node = item.get("media", item)
-                            node["product_type"] = "clips"
-                            if not node.get("shortcode") and node.get("code"):
-                                node["shortcode"] = node["code"]
-                            p = _parse_node(node)
-                            if p:
-                                batch.append(p)
+                            batch = []
+                            for item in items:
+                                node = item.get("media", item)
+                                node["product_type"] = "clips"
+                                if not node.get("shortcode") and node.get("code"):
+                                    node["shortcode"] = node["code"]
+                                p = _parse_node(node)
+                                if p:
+                                    batch.append(p)
 
-                        more        = body_r.get("more_available", False)
-                        reel_max_id = body_r.get("next_max_id") if more else None
+                            more        = body_r.get("more_available", False)
+                            reel_max_id = body_r.get("next_max_id") if more else None
 
-                        if batch:
-                            all_posts.extend(batch)
-                            reels_total += len(batch)
-                            reel_fails  = 0
-                            progress["count"] = len(all_posts)
-                            print(f"  → Reels: +{len(batch)} | total: {len(all_posts)} | more: {more}")
-                        else:
+                            if batch:
+                                all_posts.extend(batch)
+                                reels_total += len(batch)
+                                reel_fails   = 0
+                                got_any      = True
+                                progress["count"] = len(all_posts)
+                                print(f"  → Reels: +{len(batch)} | total: {len(all_posts)} | more: {more}")
+
+                        if not got_any:
                             reel_fails += 1
                             print(f"  → Reels empty ({reel_fails}/6)")
 
