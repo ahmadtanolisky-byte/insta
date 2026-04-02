@@ -138,9 +138,7 @@ def export():
 # ── Core scraping ─────────────────────────────────────────────────────────────
 
 def get_posts(username, display_limit, sort_by):
-    all_posts  = []       # normalised post dicts
-    end_cursor = None     # for pagination
-    page_count = 0
+    all_posts  = []
     limit      = 99999   # always scrape full account; trim at the end
 
     try:
@@ -151,6 +149,9 @@ def get_posts(username, display_limit, sort_by):
                     "--no-sandbox",
                     "--disable-blink-features=AutomationControlled",
                     "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                    "--disable-images",          # skip images — faster page load
+                    "--blink-settings=imagesEnabled=false",
                 ]
             )
             context = browser.new_context(
@@ -180,9 +181,15 @@ def get_posts(username, display_limit, sort_by):
             context.add_cookies(cookies)
             print(f"  ✓ {len(cookies)} cookies loaded")
 
-            # Intercept API responses
-            intercepted = []
+            # Read CSRF token once upfront
+            csrf_token = ""
+            for ck in cookies:
+                if ck.get("name") == "csrftoken":
+                    csrf_token = ck.get("value", "")
+                    break
 
+            # Intercept API responses to grab user_id and first batch
+            intercepted = []
             def handle_response(response):
                 try:
                     if "graphql/query" in response.url or "api/v1" in response.url:
@@ -196,8 +203,9 @@ def get_posts(username, display_limit, sort_by):
             page = context.new_page()
             page.on("response", handle_response)
 
-            # Load profile page
+            # ── Load profile page ─────────────────────────────────────────
             print(f"  → Loading @{username}...")
+            progress["phase"] = "Loading profile…"
             try:
                 page.goto(
                     f"https://www.instagram.com/{username}/",
@@ -208,13 +216,12 @@ def get_posts(username, display_limit, sort_by):
                 browser.close()
                 return None, "Timed out. Check your internet connection."
 
-            time.sleep(random.uniform(3.5, 5.0))
+            time.sleep(random.uniform(2.5, 3.5))   # reduced from 3.5–5.0
             _dismiss_popups(page)
 
             content = page.content()
             print(f"  → Page loaded ({len(content)} chars)")
 
-            # Check for errors
             if "/accounts/login" in page.url:
                 browser.close()
                 return None, "Session expired. Re-run 'python login.py' to refresh."
@@ -227,263 +234,194 @@ def get_posts(username, display_limit, sort_by):
                 browser.close()
                 return None, "This account is private."
 
-            # ── Extract user ID from page (needed for direct API calls) ──
+            # ── Extract user ID ───────────────────────────────────────────
             user_id = None
-            try:
-                # Try to find user ID in intercepted responses
-                for body in intercepted:
-                    uid = _find_user_id(body)
-                    if uid:
-                        user_id = uid
-                        break
-                # Fallback: search page HTML
-                if not user_id:
-                    html = page.content()
-                    m = re.search(r'"pk"\s*:\s*"?(\d{5,})"?', html)
-                    if not m:
-                        m = re.search(r'"id"\s*:\s*"(\d{5,})"', html)
-                    if m:
-                        user_id = m.group(1)
-                if user_id:
-                    print(f"  ✓ User ID: {user_id}")
-                else:
-                    print("  ⚠ Could not extract user ID — will use scroll only")
-            except Exception as e:
-                print(f"  ⚠ User ID extraction failed: {e}")
+            for body in intercepted:
+                uid = _find_user_id(body)
+                if uid:
+                    user_id = uid
+                    break
+            if not user_id:
+                html = page.content()
+                m = re.search(r'"pk"\s*:\s*"?(\d{5,})"?', html)
+                if not m:
+                    m = re.search(r'"id"\s*:\s*"(\d{5,})"', html)
+                if m:
+                    user_id = m.group(1)
 
-            # ── Parse first batch from intercepted responses ──────────────
+            if user_id:
+                print(f"  ✓ User ID: {user_id}")
+            else:
+                print("  ⚠ Could not extract user ID")
+                browser.close()
+                return None, "Could not find user ID. Try again."
+
+            # ── Grab first batch from page load intercepts ────────────────
             batch, end_cursor = _extract_posts_and_cursor(intercepted)
             all_posts.extend(batch)
             intercepted.clear()
-            page_count += 1
             progress["count"] = len(all_posts)
-            progress["phase"] = "Scrolling profile…"
-            print(f"  → Page {page_count}: {len(batch)} posts | total: {len(all_posts)} | cursor: {end_cursor is not None}")
+            print(f"  → Initial batch: {len(batch)} posts")
 
-            # ── Phase 1: Scroll to load initial posts (~first 300) ────────
-            no_change = 0
-            scroll_limit = min(limit, 300)  # scroll only gets ~300 reliably
+            # ── Helper: browser fetch (GET) ───────────────────────────────
+            def _ig_get(url):
+                raw = page.evaluate("""(args) => {
+                    return fetch(args.url, {
+                        headers: {
+                            "X-IG-App-ID": "936619743392459",
+                            "X-Requested-With": "XMLHttpRequest"
+                        },
+                        credentials: "include"
+                    }).then(r => r.text().then(t => JSON.stringify({status: r.status, text: t})))
+                      .catch(e => JSON.stringify({error: e.toString()}));
+                }""", {"url": url})
+                return json.loads(raw)
 
-            while len(all_posts) < scroll_limit:
-                page.evaluate("window.scrollTo({top:document.body.scrollHeight,behavior:'smooth'})")
-                time.sleep(random.uniform(0.8, 1.2))
+            # ── Helper: browser fetch (POST) ──────────────────────────────
+            def _ig_post_req(url, body_str):
+                result = page.evaluate("""(args) => {
+                    return fetch(args.url, {
+                        method: "POST",
+                        headers: {
+                            "X-IG-App-ID": "936619743392459",
+                            "X-CSRFToken": args.csrf,
+                            "X-Requested-With": "XMLHttpRequest",
+                            "Content-Type": "application/x-www-form-urlencoded",
+                            "Referer": "https://www.instagram.com/"
+                        },
+                        body: args.body,
+                        credentials: "include"
+                    }).then(r => r.text().then(t => ({status: r.status, text: t})))
+                      .catch(e => ({error: e.toString()}));
+                }""", {"url": url, "body": body_str, "csrf": csrf_token})
+                return result
 
-                batch, new_cursor = _extract_posts_and_cursor(intercepted)
-                intercepted.clear()
+            # ── Phase 1: Feed API pagination (skips scroll entirely) ──────
+            progress["phase"] = "Fetching posts via API…"
+            print(f"  → Skipping scroll — going straight to API pagination...")
 
-                if batch:
-                    all_posts.extend(batch)
-                    end_cursor = new_cursor or end_cursor
-                    page_count += 1
-                    progress["count"] = len(all_posts)
-                    progress["phase"] = "Scrolling profile…"
-                    print(f"  → Scroll page {page_count}: +{len(batch)} posts | total: {len(all_posts)}")
-                    no_change = 0
-                else:
-                    no_change += 1
-                    if no_change >= 4:
-                        print(f"  → Scroll exhausted at {len(all_posts)} posts.")
-                        break
+            max_id    = end_cursor
+            api_fails = 0
 
-                prev = len(all_posts)
+            while api_fails < 8:
+                base    = f"https://www.instagram.com/api/v1/feed/user/{user_id}/?count=200"
+                api_url = base + (f"&max_id={max_id}" if max_id else "")
 
-            # ── Phase 2: Direct API pagination via in-browser fetch ─────
-            # Uses the browser's authenticated session to call Instagram's
-            # internal API directly — no page navigation, no JSON rendering
-            # issues. The fetch() runs inside the page so cookies are sent.
-            if user_id and len(all_posts) < limit:
-                print(f"  → Switching to direct API pagination (user_id={user_id})...")
-                progress["phase"] = "Fetching via API…"
-
-                # Only navigate back if we've left the profile page
-                if f"instagram.com/{username}" not in page.url:
-                    try:
-                        page.goto(f"https://www.instagram.com/{username}/",
-                                  wait_until="domcontentloaded", timeout=20000)
-                        time.sleep(random.uniform(1.0, 1.5))
-                    except Exception:
-                        pass
-
-                max_id    = end_cursor  # start from where scroll left off
-                api_fails = 0
-
-                while len(all_posts) < limit and api_fails < 8:
-                    try:
-                        base = f"https://www.instagram.com/api/v1/feed/user/{user_id}/?count=50"
-                        api_url = base + (f"&max_id={max_id}" if max_id else "")
-
-                        # Single authenticated fetch via browser context
-                        raw = page.evaluate("""(args) => {
-                            return fetch(args.url, {
-                                headers: {
-                                    "X-IG-App-ID": "936619743392459",
-                                    "X-Requested-With": "XMLHttpRequest"
-                                },
-                                credentials: "include"
-                            }).then(r => r.text().then(t => JSON.stringify({status: r.status, text: t})))
-                              .catch(e => JSON.stringify({error: e.toString()}));
-                        }""", {"url": api_url})
-
-                        time.sleep(random.uniform(0.1, 0.25))
-
-                        batch, new_cursor = [], None
-                        try:
-                            resp = json.loads(raw)
-                            if "error" in resp:
-                                raise ValueError(f"API error: {resp['error']}")
-                            if resp.get("status") != 200:
-                                raise ValueError(f"HTTP {resp.get('status')}")
-                            body = json.loads(resp["text"])
-                            batch, new_cursor = _extract_posts_from_api_v1(body)
-                            if not batch:
-                                batch2, cur2 = _extract_posts_and_cursor([body])
-                                if batch2:
-                                    batch, new_cursor = batch2, cur2
-                        except Exception as e:
-                            print(f"  ⚠ Parse error: {e}")
-
-                        if batch:
-                            prev_len  = len(all_posts)
-                            all_posts.extend(batch)
-                            added     = len(all_posts) - prev_len
-                            max_id    = new_cursor
-                            api_fails = 0
-                            progress["count"] = len(all_posts)
-                            progress["phase"] = "Fetching via API…"
-                            print(f"  → API page: +{added} posts | total: {len(all_posts)} | more: {max_id is not None}")
-                            if not max_id:
-                                print("  → Reached end of account.")
-                                break
-                        else:
-                            api_fails += 1
-                            print(f"  → API page empty ({api_fails}/8) — cursor: {max_id}")
-                            if api_fails >= 8:
-                                print("  → API pagination stopped.")
-                                break
-                            time.sleep(random.uniform(2.0, 3.0))
-
-                    except Exception as e:
-                        api_fails += 1
-                        print(f"  ⚠ API error ({api_fails}/8): {e}")
-                        time.sleep(random.uniform(2.0, 3.0))
-
-            # ── Scrape Reels via direct API (includes play_count) ────────
-            if user_id:
-                print(f"  → Fetching Reels via API for @{username}...")
-                progress["phase"] = "Fetching Reels…"
                 try:
-                    # Get CSRF token from cookies file
-                    csrf_token = ""
-                    try:
-                        with open(COOKIES_FILE) as cf:
-                            for ck in json.load(cf):
-                                if ck.get("name") == "csrftoken":
-                                    csrf_token = ck.get("value", "")
-                                    break
-                        print(f"  ✓ CSRF token: {csrf_token[:10]}...")
-                    except Exception as ce:
-                        print(f"  ⚠ Could not read CSRF token: {ce}")
+                    resp = _ig_get(api_url)
+                    time.sleep(random.uniform(0.05, 0.1))   # minimal sleep
 
-                    # Navigate to profile so cookies are in scope (only if needed)
-                    if f"instagram.com/{username}" not in page.url:
-                        page.goto(f"https://www.instagram.com/{username}/",
-                                  wait_until="domcontentloaded", timeout=20000)
-                        time.sleep(random.uniform(1.0, 1.5))
+                    if "error" in resp:
+                        raise ValueError(f"fetch error: {resp['error']}")
+                    if resp.get("status") != 200:
+                        raise ValueError(f"HTTP {resp.get('status')}")
 
-                    def _ig_post(pg, url, body_str, csrf):
-                        """POST to Instagram API with CSRF token via browser fetch."""
-                        result = pg.evaluate("""(args) => {
-                            return fetch(args.url, {
-                                method: "POST",
-                                headers: {
-                                    "X-IG-App-ID": "936619743392459",
-                                    "X-CSRFToken": args.csrf,
-                                    "X-Requested-With": "XMLHttpRequest",
-                                    "Content-Type": "application/x-www-form-urlencoded",
-                                    "Referer": "https://www.instagram.com/"
-                                },
-                                body: args.body,
-                                credentials: "include"
-                            }).then(r => r.text().then(t => ({status: r.status, text: t})))
-                              .catch(e => ({error: e.toString()}));
-                        }""", {"url": url, "body": body_str, "csrf": csrf})
-                        return result
+                    body = json.loads(resp["text"])
+                    batch, new_cursor = _extract_posts_from_api_v1(body)
+                    if not batch:
+                        batch, new_cursor = _extract_posts_and_cursor([body])
 
-                    reel_max_id = None
-                    reel_fails  = 0
-                    reels_total = 0
-
-                    while reel_fails < 6:
-                        body_str = f"target_user_id={user_id}&page_size=50"
-                        if reel_max_id:
-                            body_str += f"&max_id={reel_max_id}"
-
-                        probe = _ig_post(page,
-                                         "https://www.instagram.com/api/v1/clips/user/",
-                                         body_str, csrf_token)
-                        time.sleep(random.uniform(0.15, 0.3))
-
-                        try:
-                            if "error" in probe:
-                                raise ValueError(f"fetch error: {probe['error']}")
-                            status = probe.get("status", 0)
-                            text   = probe.get("text", "")
-
-                            if status != 200:
-                                raise ValueError(f"HTTP {status}: {text[:80]}")
-
-                            body_r = json.loads(text)
-                            items  = body_r.get("items", [])
-
-                            batch = []
-                            for item in items:
-                                # Response structure: item = {"media": {all fields}}
-                                # play_count, code, like_count etc. are ALL inside media
-                                node = item.get("media", item)
-                                node["product_type"] = "clips"
-                                # Ensure shortcode is set — reels use "code" field
-                                if not node.get("shortcode") and node.get("code"):
-                                    node["shortcode"] = node["code"]
-                                # views: play_count is confirmed present in media node
-                                # _parse_node already reads play_count — nothing extra needed
-                                p = _parse_node(node)
-                                if p:
-                                    batch.append(p)
-                                else:
-                                    # Debug why parse failed
-                                    sc = node.get("code") or node.get("shortcode") or node.get("pk","?")
-                                    print(f"  [DEBUG] parse failed for node pk={sc}")
-
-                            more        = body_r.get("more_available", False)
-                            reel_max_id = body_r.get("next_max_id") if more else None
-
-                            if batch:
-                                prev_len = len(all_posts)
-                                all_posts.extend(batch)
-                                added = len(all_posts) - prev_len
-                                reels_total += len(batch)
-                                reel_fails = 0
-                                progress["count"] = len(all_posts)
-                                print(f"  → Reels: +{len(batch)} | total: {len(all_posts)} | more: {more}")
-                            else:
-                                reel_fails += 1
-                                print(f"  → Reels empty ({reel_fails}/6)")
-
-                            if not reel_max_id:
-                                print(f"  → Reels done. Added: {reels_total}")
-                                break
-
-                        except Exception as re:
-                            reel_fails += 1
-                            print(f"  ⚠ Reels error ({reel_fails}/6): {re}")
-                            time.sleep(random.uniform(2.0, 3.0))
+                    if batch:
+                        all_posts.extend(batch)
+                        max_id    = new_cursor
+                        api_fails = 0
+                        progress["count"] = len(all_posts)
+                        print(f"  → Feed API: +{len(batch)} | total: {len(all_posts)} | more: {max_id is not None}")
+                        if not max_id:
+                            print("  → Reached end of feed.")
+                            break
+                    else:
+                        api_fails += 1
+                        print(f"  → Feed empty ({api_fails}/8)")
+                        if api_fails >= 8:
+                            # Feed API completely failed — fall back to scroll
+                            if len(all_posts) == 0:
+                                print("  → Feed API failed entirely — falling back to scroll...")
+                                progress["phase"] = "Scrolling profile (fallback)…"
+                                no_change = 0
+                                while no_change < 4:
+                                    page.evaluate("window.scrollTo({top:document.body.scrollHeight,behavior:'smooth'})")
+                                    time.sleep(random.uniform(0.8, 1.2))
+                                    scroll_batch, scroll_cursor = _extract_posts_and_cursor(intercepted)
+                                    intercepted.clear()
+                                    if scroll_batch:
+                                        all_posts.extend(scroll_batch)
+                                        end_cursor = scroll_cursor or end_cursor
+                                        progress["count"] = len(all_posts)
+                                        print(f"  → Scroll fallback: +{len(scroll_batch)} | total: {len(all_posts)}")
+                                        no_change = 0
+                                    else:
+                                        no_change += 1
+                                print(f"  → Scroll fallback done: {len(all_posts)} posts")
+                            break
+                        time.sleep(random.uniform(1.0, 2.0))
 
                 except Exception as e:
-                    print(f"  ⚠ Reels failed (non-fatal): {e}")
+                    api_fails += 1
+                    print(f"  ⚠ Feed API error ({api_fails}/8): {e}")
+                    time.sleep(random.uniform(1.0, 2.0))
 
-                        # View count enrichment skipped — Instagram blocks it and
-            # returns unavailable for all videos, causing massive slowdowns.
-            # Views captured directly from feed API responses are used instead.
+            # ── Phase 2: Reels API (runs immediately after feed) ──────────
+            if user_id and csrf_token:
+                progress["phase"] = "Fetching Reels…"
+                print(f"  → Fetching Reels for @{username}...")
+
+                reel_max_id = None
+                reel_fails  = 0
+                reels_total = 0
+
+                while reel_fails < 6:
+                    body_str = f"target_user_id={user_id}&page_size=100"
+                    if reel_max_id:
+                        body_str += f"&max_id={reel_max_id}"
+
+                    try:
+                        probe = _ig_post_req(
+                            "https://www.instagram.com/api/v1/clips/user/",
+                            body_str
+                        )
+                        time.sleep(random.uniform(0.05, 0.1))   # minimal sleep
+
+                        if "error" in probe:
+                            raise ValueError(f"fetch error: {probe['error']}")
+                        if probe.get("status") != 200:
+                            raise ValueError(f"HTTP {probe.get('status')}: {probe.get('text','')[:80]}")
+
+                        body_r = json.loads(probe["text"])
+                        items  = body_r.get("items", [])
+
+                        batch = []
+                        for item in items:
+                            node = item.get("media", item)
+                            node["product_type"] = "clips"
+                            if not node.get("shortcode") and node.get("code"):
+                                node["shortcode"] = node["code"]
+                            p = _parse_node(node)
+                            if p:
+                                batch.append(p)
+
+                        more        = body_r.get("more_available", False)
+                        reel_max_id = body_r.get("next_max_id") if more else None
+
+                        if batch:
+                            all_posts.extend(batch)
+                            reels_total += len(batch)
+                            reel_fails  = 0
+                            progress["count"] = len(all_posts)
+                            print(f"  → Reels: +{len(batch)} | total: {len(all_posts)} | more: {more}")
+                        else:
+                            reel_fails += 1
+                            print(f"  → Reels empty ({reel_fails}/6)")
+
+                        if not reel_max_id:
+                            print(f"  → Reels done. Added: {reels_total}")
+                            break
+
+                    except Exception as re_err:
+                        reel_fails += 1
+                        print(f"  ⚠ Reels error ({reel_fails}/6): {re_err}")
+                        time.sleep(random.uniform(1.0, 2.0))
+
             browser.close()
 
     except Exception as e:
@@ -491,11 +429,12 @@ def get_posts(username, display_limit, sort_by):
         return None, f"Browser error: {str(e)[:200]}"
 
     if not all_posts:
-        return None, "No posts found. Session may have expired — re-run 'python login.py'."
+        return None, "No posts found. The account may have no public posts, or the session expired — re-run 'python login.py'."
 
     all_posts = _dedup(all_posts)
     print(f"  → Done. Total unique posts: {len(all_posts)}")
     return _sort_and_trim(all_posts, sort_by, display_limit)
+
 
 
 def _extract_posts_and_cursor(intercepted_list):
